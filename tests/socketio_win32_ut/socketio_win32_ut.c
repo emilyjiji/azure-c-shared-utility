@@ -76,7 +76,9 @@ static SOCKET test_socket = (SOCKET)0x4243;
 static size_t list_head_count = 0;
 static bool singlylinkedlist_add_called = false;
 static size_t callbackContext = 11;
-static const struct sockaddr test_sock_addr = { 0 };
+/* sa_family must agree with ai_family below, as it does for a real getaddrinfo
+   result; socketio_open rejects a candidate whose families disagree. */
+static const struct sockaddr test_sock_addr = { AF_INET, { 0 } };
 static ADDRINFO TEST_ADDR_INFO = { AI_PASSIVE, AF_INET, SOCK_STREAM, IPPROTO_TCP, 128, NULL, (struct sockaddr*)&test_sock_addr, NULL };
 
 static const char* TEST_BUFFER_VALUE = "test_buffer_value";

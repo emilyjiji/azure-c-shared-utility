@@ -7,7 +7,9 @@
 #include <ctype.h>
 #include <limits.h>
 #include "azure_c_shared_utility/gballoc.h"
+#include "azure_c_shared_utility/safe_math.h"
 #include "azure_c_shared_utility/uws_client.h"
+#include "host_utils.h"
 #include "azure_c_shared_utility/optimize_size.h"
 #include "azure_c_shared_utility/xlogging.h"
 #include "azure_c_shared_utility/xio.h"
@@ -32,19 +34,6 @@ static const char* HTTP_HEADER_KEY_VALUE_SEPARATOR = ": ";
 static const size_t HTTP_HEADER_KEY_VALUE_SEPARATOR_LENGTH = 2;
 static const char* HTTP_HEADER_TERMINATOR = "\r\n";
 static const size_t HTTP_HEADER_TERMINATOR_LENGTH = 2;
-
-static bool host_needs_ipv6_brackets(const char* hostname)
-{
-    size_t hostname_length = strlen(hostname);
-    return strchr(hostname, ':') != NULL &&
-        !(hostname_length >= 2 && hostname[0] == '[' && hostname[hostname_length - 1] == ']');
-}
-
-static size_t host_without_scope_length(const char* hostname)
-{
-    const char* scope = strchr(hostname, '%');
-    return (scope == NULL) ? strlen(hostname) : (size_t)(scope - hostname);
-}
 
 /* Requirements not needed as they are optional:
 Codes_SRS_UWS_CLIENT_01_254: [ If an endpoint receives a Ping frame and has not yet sent Pong frame(s) in response to previous Ping frame(s), the endpoint MAY elect to send a Pong frame for only the most recently processed Ping frame. ]
@@ -791,7 +780,6 @@ static void on_underlying_io_open_complete(void* context, IO_OPEN_RESULT_DETAILE
 
             case IO_OPEN_OK:
             {
-                int upgrade_request_length;
                 char* upgrade_request;
                 size_t i;
                 unsigned char nonce[16];
@@ -838,104 +826,153 @@ static void on_underlying_io_open_complete(void* context, IO_OPEN_RESULT_DETAILE
                     /* Codes_SRS_UWS_CLIENT_01_096: [ The request MAY include a header field with the name |Sec-WebSocket-Protocol|. ]*/
                     /* Codes_SRS_UWS_CLIENT_01_100: [ The request MAY include a header field with the name |Sec-WebSocket-Extensions|. ]*/
                     /* Codes_SRS_UWS_CLIENT_01_101: [ The request MAY include any other header fields, for example, cookies [RFC6265] and/or authentication-related header fields such as the |Authorization| header field [RFC2616], which are processed according to documents that define them. ] */
-                    const size_t authority_host_length = host_without_scope_length(uws_client->hostname);
-                    const char* upgrade_request_format = host_needs_ipv6_brackets(uws_client->hostname)
-                        ? "GET %s HTTP/1.1\r\n"
-                            "Host: [%.*s]:%d\r\n"
-                            "Upgrade: websocket\r\n"
-                            "Connection: Upgrade\r\n"
-                            "Sec-WebSocket-Key: %s\r\n"
-                            "Sec-WebSocket-Version: 13\r\n"
-                            "%s"
-                        : "GET %s HTTP/1.1\r\n"
-                            "Host: %.*s:%d\r\n"
-                            "Upgrade: websocket\r\n"
-                            "Connection: Upgrade\r\n"
-                            "Sec-WebSocket-Key: %s\r\n"
-                            "Sec-WebSocket-Version: 13\r\n"
-                            "%s"; // custom headers
-                    const char web_socket_protocol_format[] = "Sec-WebSocket-Protocol: %s";
-
+                    const char upgrade_request_method[] = "GET ";
+                    const char upgrade_request_host[] = " HTTP/1.1\r\nHost: ";
+                    const char upgrade_request_after_port[] = "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ";
+                    const char upgrade_request_after_nonce[] = "\r\nSec-WebSocket-Version: 13\r\n";
+                    const char web_socket_protocol_prefix[] = "Sec-WebSocket-Protocol: ";
+                    const char web_socket_protocol_separator[] = ", ";
+                    const char web_socket_protocol_terminator[] = "\r\n";
+                    const char upgrade_request_terminator[] = "\r\n";
+                    const char host_port_separator[] = ":";
                     const char* base64_nonce_chars = STRING_c_str(base64_nonce);
+                    size_t authority_length = authority_host_length(uws_client->hostname);
+                    size_t upgrade_request_length = 0;
+                    size_t upgrade_request_size;
+                    size_t upgrade_request_position;
+                    size_t port_length = (uws_client->port < 0) ? 1 : 0;
+                    int port_value = uws_client->port;
+                    int formatted_port_length;
 
-                    upgrade_request_length = (int)(strlen(upgrade_request_format) + strlen(uws_client->resource_name) + strlen(uws_client->hostname) + strlen(base64_nonce_chars) + strlen(request_headers)+ 7);
+                    do
+                    {
+                        port_length++;
+                        port_value /= 10;
+                    } while (port_value != 0);
+
+                    upgrade_request_length = safe_add_size_t(upgrade_request_length, sizeof(upgrade_request_method) - 1);
+                    upgrade_request_length = safe_add_size_t(upgrade_request_length, strlen(uws_client->resource_name));
+                    upgrade_request_length = safe_add_size_t(upgrade_request_length, sizeof(upgrade_request_host) - 1);
+                    upgrade_request_length = safe_add_size_t(upgrade_request_length, authority_length);
+                    upgrade_request_length = safe_add_size_t(upgrade_request_length, sizeof(host_port_separator) - 1);
+                    upgrade_request_length = safe_add_size_t(upgrade_request_length, port_length);
+                    upgrade_request_length = safe_add_size_t(upgrade_request_length, sizeof(upgrade_request_after_port) - 1);
+                    upgrade_request_length = safe_add_size_t(upgrade_request_length, strlen(base64_nonce_chars));
+                    upgrade_request_length = safe_add_size_t(upgrade_request_length, sizeof(upgrade_request_after_nonce) - 1);
+                    upgrade_request_length = safe_add_size_t(upgrade_request_length, strlen(request_headers));
+
                     if (hasProtocol)
                     {
-                        // 2 * since each protocol entry is separated from the previous one by ", "    +2 for trailing \r\n
-                        upgrade_request_length += (int)(strlen(web_socket_protocol_format) + (2 * uws_client->protocol_count) + 2);
-                        for (size_t j = 0; j < uws_client->protocol_count; j++)
+                        for (i = 0; i < uws_client->protocol_count; i++)
                         {
-                            upgrade_request_length += (int)strlen(uws_client->protocols[j].protocol);
+                            upgrade_request_length = safe_add_size_t(upgrade_request_length, (i == 0) ? sizeof(web_socket_protocol_prefix) - 1 : sizeof(web_socket_protocol_separator) - 1);
+                            upgrade_request_length = safe_add_size_t(upgrade_request_length, strlen(uws_client->protocols[i].protocol));
                         }
+
+                        upgrade_request_length = safe_add_size_t(upgrade_request_length, sizeof(web_socket_protocol_terminator) - 1);
                     }
-                    
-                    if (upgrade_request_length < 0)
+
+                    upgrade_request_length = safe_add_size_t(upgrade_request_length, sizeof(upgrade_request_terminator) - 1);
+                    upgrade_request_size = safe_add_size_t(upgrade_request_length, 1);
+
+                    if (upgrade_request_size == SIZE_MAX)
                     {
                         /* Codes_SRS_UWS_CLIENT_01_408: [ If constructing of the WebSocket upgrade request fails, uws shall report that the open failed by calling the `on_ws_open_complete` callback passed to `uws_client_open_async` with `WS_OPEN_ERROR_CONSTRUCTING_UPGRADE_REQUEST`. ]*/
                         LogError("Cannot construct the WebSocket upgrade request");
                         ws_open_result.result = WS_OPEN_ERROR_CONSTRUCTING_UPGRADE_REQUEST;
                         indicate_ws_open_complete_error_and_close(uws_client, ws_open_result);
                     }
+                    else if ((upgrade_request = (char*)malloc(upgrade_request_size)) == NULL)
+                    {
+                        /* Codes_SRS_UWS_CLIENT_01_406: [ If not enough memory can be allocated to construct the WebSocket upgrade request, uws shall report that the open failed by calling the `on_ws_open_complete` callback passed to `uws_client_open_async` with `WS_OPEN_ERROR_NOT_ENOUGH_MEMORY`. ]*/
+                        LogError("Cannot allocate memory for the WebSocket upgrade request");
+                        ws_open_result.result = WS_OPEN_ERROR_NOT_ENOUGH_MEMORY;
+                        indicate_ws_open_complete_error_and_close(uws_client, ws_open_result);
+                    }
                     else
                     {
-#pragma warning(push)
-#pragma warning(disable:26451)
-                        upgrade_request = (char*)malloc(upgrade_request_length + 1);
-#pragma warning(pop) // C26451
-                        if (upgrade_request == NULL)
+                        upgrade_request_position = 0;
+                        (void)memcpy(upgrade_request + upgrade_request_position, upgrade_request_method, sizeof(upgrade_request_method) - 1);
+                        upgrade_request_position += sizeof(upgrade_request_method) - 1;
+                        (void)memcpy(upgrade_request + upgrade_request_position, uws_client->resource_name, strlen(uws_client->resource_name));
+                        upgrade_request_position += strlen(uws_client->resource_name);
+                        (void)memcpy(upgrade_request + upgrade_request_position, upgrade_request_host, sizeof(upgrade_request_host) - 1);
+                        upgrade_request_position += sizeof(upgrade_request_host) - 1;
+
+                        if (format_host_for_authority(uws_client->hostname, upgrade_request + upgrade_request_position, authority_length + 1) != 0)
                         {
-                            /* Codes_SRS_UWS_CLIENT_01_406: [ If not enough memory can be allocated to construct the WebSocket upgrade request, uws shall report that the open failed by calling the `on_ws_open_complete` callback passed to `uws_client_open_async` with `WS_OPEN_ERROR_NOT_ENOUGH_MEMORY`. ]*/
-                            LogError("Cannot allocate memory for the WebSocket upgrade request");
-                            ws_open_result.result = WS_OPEN_ERROR_NOT_ENOUGH_MEMORY;
+                            LogError("Cannot format host for the WebSocket upgrade request");
+                            ws_open_result.result = WS_OPEN_ERROR_CONSTRUCTING_UPGRADE_REQUEST;
                             indicate_ws_open_complete_error_and_close(uws_client, ws_open_result);
                         }
                         else
                         {
-                            upgrade_request_length = sprintf(upgrade_request, upgrade_request_format,
-                                uws_client->resource_name,
-                                (int)authority_host_length,
-                                uws_client->hostname,
-                                uws_client->port,
-                                base64_nonce_chars,
-                                request_headers);
+                            upgrade_request_position += authority_length;
+                            (void)memcpy(upgrade_request + upgrade_request_position, host_port_separator, sizeof(host_port_separator) - 1);
+                            upgrade_request_position += sizeof(host_port_separator) - 1;
+                            formatted_port_length = snprintf(upgrade_request + upgrade_request_position, port_length + 1, "%d", uws_client->port);
 
-                            if (hasProtocol)
+                            if ((formatted_port_length < 0) || ((size_t)formatted_port_length != port_length))
                             {
-                                bool first = true;
-
-                                for (size_t j = 0; j < uws_client->protocol_count; j++, first = false)
-                                {
-                                    upgrade_request_length += sprintf(
-                                        upgrade_request + upgrade_request_length,
-                                        first ? web_socket_protocol_format : ", %s",
-                                        uws_client->protocols[j].protocol);
-                                }
-
-                                upgrade_request_length += sprintf(upgrade_request + upgrade_request_length, "\r\n");
-                            }
-
-                            upgrade_request_length += sprintf(upgrade_request + upgrade_request_length, "\r\n");
-
-                            /* No need to have any send complete here, as we are monitoring the received bytes */
-                            /* Codes_SRS_UWS_CLIENT_01_372: [ Once prepared the WebSocket upgrade request shall be sent by calling `xio_send`. ]*/
-                            /* Codes_SRS_UWS_CLIENT_01_080: [ Once a connection to the server has been established (including a connection via a proxy or over a TLS-encrypted tunnel), the client MUST send an opening handshake to the server. ]*/
-                            LogInfo("Sending WebSocket upgrade request to %s:%d%s", uws_client->hostname, uws_client->port, uws_client->resource_name);
-                            if (xio_send(uws_client->underlying_io, upgrade_request, upgrade_request_length, unchecked_on_send_complete, NULL) != 0)
-                            {
-                                /* Codes_SRS_UWS_CLIENT_01_373: [ If `xio_send` fails then uws shall report that the open failed by calling the `on_ws_open_complete` callback passed to `uws_client_open_async` with `WS_OPEN_ERROR_CANNOT_SEND_UPGRADE_REQUEST`. ]*/
-                                LogError("Cannot send upgrade request");
-                                ws_open_result.result = WS_OPEN_ERROR_CANNOT_SEND_UPGRADE_REQUEST;
+                                LogError("Cannot format port for the WebSocket upgrade request");
+                                ws_open_result.result = WS_OPEN_ERROR_CONSTRUCTING_UPGRADE_REQUEST;
                                 indicate_ws_open_complete_error_and_close(uws_client, ws_open_result);
                             }
                             else
                             {
-                                /* Codes_SRS_UWS_CLIENT_01_102: [ Once the client's opening handshake has been sent, the client MUST wait for a response from the server before sending any further data. ]*/
-                                uws_client->uws_state = UWS_STATE_WAITING_FOR_UPGRADE_RESPONSE;
-                                LogInfo("WebSocket upgrade request sent, waiting for response from %s:%d", uws_client->hostname, uws_client->port);
-                            }
+                                upgrade_request_position += port_length;
+                                (void)memcpy(upgrade_request + upgrade_request_position, upgrade_request_after_port, sizeof(upgrade_request_after_port) - 1);
+                                upgrade_request_position += sizeof(upgrade_request_after_port) - 1;
+                                (void)memcpy(upgrade_request + upgrade_request_position, base64_nonce_chars, strlen(base64_nonce_chars));
+                                upgrade_request_position += strlen(base64_nonce_chars);
+                                (void)memcpy(upgrade_request + upgrade_request_position, upgrade_request_after_nonce, sizeof(upgrade_request_after_nonce) - 1);
+                                upgrade_request_position += sizeof(upgrade_request_after_nonce) - 1;
+                                (void)memcpy(upgrade_request + upgrade_request_position, request_headers, strlen(request_headers));
+                                upgrade_request_position += strlen(request_headers);
 
-                            free(upgrade_request);
+                                if (hasProtocol)
+                                {
+                                    for (i = 0; i < uws_client->protocol_count; i++)
+                                    {
+                                        const char* protocol_separator = (i == 0) ? web_socket_protocol_prefix : web_socket_protocol_separator;
+                                        size_t protocol_separator_length = (i == 0) ? sizeof(web_socket_protocol_prefix) - 1 : sizeof(web_socket_protocol_separator) - 1;
+                                        size_t protocol_length = strlen(uws_client->protocols[i].protocol);
+
+                                        (void)memcpy(upgrade_request + upgrade_request_position, protocol_separator, protocol_separator_length);
+                                        upgrade_request_position += protocol_separator_length;
+                                        (void)memcpy(upgrade_request + upgrade_request_position, uws_client->protocols[i].protocol, protocol_length);
+                                        upgrade_request_position += protocol_length;
+                                    }
+
+                                    (void)memcpy(upgrade_request + upgrade_request_position, web_socket_protocol_terminator, sizeof(web_socket_protocol_terminator) - 1);
+                                    upgrade_request_position += sizeof(web_socket_protocol_terminator) - 1;
+                                }
+
+                                (void)memcpy(upgrade_request + upgrade_request_position, upgrade_request_terminator, sizeof(upgrade_request_terminator) - 1);
+                                upgrade_request_position += sizeof(upgrade_request_terminator) - 1;
+                                upgrade_request[upgrade_request_position] = '\0';
+
+                                /* No need to have any send complete here, as we are monitoring the received bytes */
+                                /* Codes_SRS_UWS_CLIENT_01_372: [ Once prepared the WebSocket upgrade request shall be sent by calling `xio_send`. ]*/
+                                /* Codes_SRS_UWS_CLIENT_01_080: [ Once a connection to the server has been established (including a connection via a proxy or over a TLS-encrypted tunnel), the client MUST send an opening handshake to the server. ]*/
+                                LogInfo("Sending WebSocket upgrade request to %s:%d%s", uws_client->hostname, uws_client->port, uws_client->resource_name);
+                                if (xio_send(uws_client->underlying_io, upgrade_request, upgrade_request_length, unchecked_on_send_complete, NULL) != 0)
+                                {
+                                    /* Codes_SRS_UWS_CLIENT_01_373: [ If `xio_send` fails then uws shall report that the open failed by calling the `on_ws_open_complete` callback passed to `uws_client_open_async` with `WS_OPEN_ERROR_CANNOT_SEND_UPGRADE_REQUEST`. ]*/
+                                    LogError("Cannot send upgrade request");
+                                    ws_open_result.result = WS_OPEN_ERROR_CANNOT_SEND_UPGRADE_REQUEST;
+                                    indicate_ws_open_complete_error_and_close(uws_client, ws_open_result);
+                                }
+                                else
+                                {
+                                    /* Codes_SRS_UWS_CLIENT_01_102: [ Once the client's opening handshake has been sent, the client MUST wait for a response from the server before sending any further data. ]*/
+                                    uws_client->uws_state = UWS_STATE_WAITING_FOR_UPGRADE_RESPONSE;
+                                    LogInfo("WebSocket upgrade request sent, waiting for response from %s:%d", uws_client->hostname, uws_client->port);
+                                }
+                            }
                         }
+
+                        free(upgrade_request);
                     }
 
                     STRING_delete(base64_nonce);
@@ -2404,3 +2441,4 @@ void clear_pending_sends(UWS_CLIENT_INSTANCE* uws_client)
         LogInfo("%s: cancelled frame %p", __FUNCTION__, first_pending_send);
     }
 }
+

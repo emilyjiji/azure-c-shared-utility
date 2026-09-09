@@ -56,6 +56,11 @@
 #endif
 
 #define CONNECT_TIMEOUT_SECONDS 10
+// Overall budget for opening a connection, across every resolved address.
+#define CONNECT_TIMEOUT_MS (CONNECT_TIMEOUT_SECONDS * 1000)
+// Cap on a single attempt while other candidates remain, so one blackholed
+// address cannot consume the whole budget.
+#define CONNECT_ATTEMPT_TIMEOUT_MS 5000
 #define SOCKETIO_POLL_TIMEOUT_ERROR 110  /* ETIMEDOUT equivalent for poll timeout */
 
 typedef enum IO_STATE_TAG
@@ -610,6 +615,43 @@ void socketio_destroy(CONCRETE_IO_HANDLE socket_io)
     }
 }
 
+// Rejects a resolved address that cannot safely be handed to socket() and
+// connect(). The caller skips it and moves on to the next candidate.
+static int validate_addrinfo(const struct addrinfo* address, const char* hostname, int* error_code)
+{
+    int result = 0;
+
+    if (address->ai_addr == NULL)
+    {
+        *error_code = EINVAL;
+        LogError("Failure: resolved address is NULL for host %s.", hostname);
+        result = __FAILURE__;
+    }
+    else if ((address->ai_family != AF_INET) && (address->ai_family != AF_INET6))
+    {
+        *error_code = EAFNOSUPPORT;
+        LogError("Failure: unsupported address family %d for host %s.", address->ai_family, hostname);
+        result = __FAILURE__;
+    }
+    else if (((address->ai_family == AF_INET) && (address->ai_addrlen < sizeof(struct sockaddr_in))) ||
+             ((address->ai_family == AF_INET6) && (address->ai_addrlen < sizeof(struct sockaddr_in6))))
+    {
+        *error_code = EINVAL;
+        LogError("Failure: resolved address length %zu is too short for host %s.",
+            (size_t)address->ai_addrlen, hostname);
+        result = __FAILURE__;
+    }
+    else if ((int)address->ai_addr->sa_family != address->ai_family)
+    {
+        *error_code = EINVAL;
+        LogError("Failure: resolved address family %u does not match addrinfo family %d for host %s.",
+            (unsigned int)address->ai_addr->sa_family, address->ai_family, hostname);
+        result = __FAILURE__;
+    }
+
+    return result;
+}
+
 static int connect_to_addrinfo(SOCKET_IO_INSTANCE* socket_io_instance, const struct addrinfo* address, int timeout_ms, int* error_code)
 {
     int result;
@@ -827,26 +869,52 @@ int socketio_open(CONCRETE_IO_HANDLE socket_io, ON_IO_OPEN_COMPLETE on_io_open_c
                 }
                 else
                 {
-                    size_t address_count = 0;
+                    size_t remaining_address_count = 0;
                     int connect_error = __FAILURE__;
+                    int remaining_timeout_ms = CONNECT_TIMEOUT_MS;
                     struct addrinfo* address;
 
                     for (address = addrInfo; address != NULL; address = address->ai_next)
                     {
-                        address_count++;
+                        remaining_address_count++;
                     }
 
                     result = __FAILURE__;
-                    for (address = addrInfo; address != NULL; address = address->ai_next)
+                    for (address = addrInfo; address != NULL; address = address->ai_next, remaining_address_count--)
                     {
-                        int timeout_ms = (address_count == 0)
-                            ? CONNECT_TIMEOUT_SECONDS * 1000
-                            : (CONNECT_TIMEOUT_SECONDS * 1000) / (int)address_count;
+                        int timeout_ms;
+
+                        if (validate_addrinfo(address, socket_io_instance->hostname, &connect_error) != 0)
+                        {
+                            continue;
+                        }
+
+                        // The last remaining candidate gets the whole budget, so a
+                        // single-address lookup times out exactly as it did before.
+                        // While others remain, cap the attempt so one blackholed
+                        // address cannot starve them.
+                        timeout_ms = remaining_timeout_ms;
+                        if ((remaining_address_count > 1) && (timeout_ms > CONNECT_ATTEMPT_TIMEOUT_MS))
+                        {
+                            timeout_ms = CONNECT_ATTEMPT_TIMEOUT_MS;
+                        }
 
                         if (connect_to_addrinfo(socket_io_instance, address, timeout_ms, &connect_error) == 0)
                         {
                             result = 0;
                             break;
+                        }
+
+                        // Only an attempt that ran out its grant consumes the budget.
+                        // A refused or unreachable address returns immediately and must
+                        // not cost the addresses behind it their chance to connect.
+                        if (connect_error == SOCKETIO_POLL_TIMEOUT_ERROR)
+                        {
+                            remaining_timeout_ms -= timeout_ms;
+                            if (remaining_timeout_ms <= 0)
+                            {
+                                break;
+                            }
                         }
                     }
 

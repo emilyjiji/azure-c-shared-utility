@@ -9,6 +9,7 @@ cmake_policy(SET CMP0063 NEW)
 if (TARGET aziotsharedutil)
     RETURN()
 endif()
+
 project(azure_c_shared_utility)
 
 FILE(READ ${CMAKE_CURRENT_LIST_DIR}/version.txt C_SHARED_VERSION)
@@ -180,6 +181,7 @@ ${LOGGING_C_FILE}
 ./src/hmac.c
 ./src/hmacsha256.c
 ./src/http_proxy_io.c
+./src/host_utils.c
 ./src/xio.c
 ./src/singlylinkedlist.c
 ./src/map.c
@@ -600,3 +602,4 @@ else()
         LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
         ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 endif()
+

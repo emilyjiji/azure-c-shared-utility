@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <limits.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -16,7 +17,11 @@
 #include "azure_c_shared_utility/xlogging.h"
 #include "azure_c_shared_utility/safe_math.h"
 
+// Overall budget for opening a connection, across every resolved address.
 #define CONNECT_TIMEOUT_MS 10000
+// Cap on a single attempt while other candidates remain, so one blackholed
+// address cannot consume the whole budget.
+#define CONNECT_ATTEMPT_TIMEOUT_MS 5000
 
 typedef enum IO_STATE_TAG
 {
@@ -257,6 +262,50 @@ void socketio_destroy(CONCRETE_IO_HANDLE socket_io)
     }
 }
 
+// Rejects a resolved address that cannot safely be handed to socket() and
+// connect(). The caller skips it and moves on to the next candidate.
+static int validate_addrinfo(const ADDRINFO* addr, const char* hostname, int* error_code)
+{
+    int result = 0;
+
+    if (addr->ai_addr == NULL)
+    {
+        *error_code = WSAEINVAL;
+        LogError("Failure: resolved address is NULL for host %s.", hostname);
+        result = __FAILURE__;
+    }
+    else if ((addr->ai_family != AF_INET) && (addr->ai_family != AF_INET6))
+    {
+        *error_code = WSAEAFNOSUPPORT;
+        LogError("Failure: unsupported address family %d for host %s.", addr->ai_family, hostname);
+        result = __FAILURE__;
+    }
+    else if (((addr->ai_family == AF_INET) && (addr->ai_addrlen < sizeof(struct sockaddr_in))) ||
+             ((addr->ai_family == AF_INET6) && (addr->ai_addrlen < sizeof(struct sockaddr_in6))))
+    {
+        *error_code = WSAEINVAL;
+        LogError("Failure: resolved address length %llu is too short for host %s.",
+            (unsigned long long)addr->ai_addrlen, hostname);
+        result = __FAILURE__;
+    }
+    else if (addr->ai_addrlen > (size_t)INT_MAX)
+    {
+        *error_code = WSAEINVAL;
+        LogError("Failure: resolved address length %llu does not fit connect for host %s.",
+            (unsigned long long)addr->ai_addrlen, hostname);
+        result = __FAILURE__;
+    }
+    else if (addr->ai_addr->sa_family != addr->ai_family)
+    {
+        *error_code = WSAEINVAL;
+        LogError("Failure: resolved address family %u does not match addrinfo family %d for host %s.",
+            (unsigned int)addr->ai_addr->sa_family, addr->ai_family, hostname);
+        result = __FAILURE__;
+    }
+
+    return result;
+}
+
 // Attempt to connect to a single resolved address. On success returns 0 with the
 // socket open and non-blocking; on failure returns __FAILURE__, closes the socket,
 // sets it to INVALID_SOCKET, and records the Winsock error in *error_code.
@@ -455,38 +504,47 @@ int socketio_open(CONCRETE_IO_HANDLE socket_io, ON_IO_OPEN_COMPLETE on_io_open_c
             {
                 // getaddrinfo can return several addresses (e.g. AAAA then A).
                 // Try each in turn and keep the first that connects.
-                size_t address_count = 0;
+                size_t remaining_address_count = 0;
                 for (ADDRINFO* rp = addrInfo; rp != NULL; rp = rp->ai_next)
                 {
-                    address_count++;
+                    remaining_address_count++;
                 }
                 int connect_error = __FAILURE__;
                 int remaining_timeout_ms = CONNECT_TIMEOUT_MS;
-                size_t remaining_address_count = address_count;
                 result = __FAILURE__;
-                for (ADDRINFO* rp = addrInfo; rp != NULL; rp = rp->ai_next)
+                for (ADDRINFO* rp = addrInfo; rp != NULL; rp = rp->ai_next, remaining_address_count--)
                 {
-                    int timeout_ms = remaining_timeout_ms / (int)remaining_address_count;
-                    if (timeout_ms == 0)
+                    if (validate_addrinfo(rp, hostname, &connect_error) != 0)
                     {
-                        timeout_ms = 1;
+                        continue;
                     }
 
-                    ULONGLONG attempt_start = GetTickCount64();
+                    // The last remaining candidate gets the whole budget, so a
+                    // single-address lookup times out exactly as it did before.
+                    // While others remain, cap the attempt so one blackholed
+                    // address cannot starve them.
+                    int timeout_ms = remaining_timeout_ms;
+                    if ((remaining_address_count > 1) && (timeout_ms > CONNECT_ATTEMPT_TIMEOUT_MS))
+                    {
+                        timeout_ms = CONNECT_ATTEMPT_TIMEOUT_MS;
+                    }
+
                     if (connect_to_addrinfo(socket_io_instance, rp, timeout_ms, &connect_error) == 0)
                     {
                         result = 0;
                         break;
                     }
 
-                    ULONGLONG elapsed_ms = GetTickCount64() - attempt_start;
-                    remaining_timeout_ms = elapsed_ms >= (ULONGLONG)remaining_timeout_ms
-                        ? 0
-                        : remaining_timeout_ms - (int)elapsed_ms;
-                    remaining_address_count--;
-                    if (remaining_timeout_ms == 0)
+                    // Only an attempt that ran out its grant consumes the budget.
+                    // A refused or unreachable address returns immediately and must
+                    // not cost the addresses behind it their chance to connect.
+                    if (connect_error == WSAETIMEDOUT)
                     {
-                        break;
+                        remaining_timeout_ms -= timeout_ms;
+                        if (remaining_timeout_ms <= 0)
+                        {
+                            break;
+                        }
                     }
                 }
 

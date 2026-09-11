@@ -22,6 +22,11 @@
 // Cap on a single attempt while other candidates remain, so one blackholed
 // address cannot consume the whole budget.
 #define CONNECT_ATTEMPT_TIMEOUT_MS 5000
+// Held back for the first address of a family that has not been attempted yet.
+#define CONNECT_FAMILY_RESERVE_MS 5000
+// An attempt granted less than this is not worth making; the budget is better
+// spent on the untried family behind it.
+#define CONNECT_MIN_ATTEMPT_TIMEOUT_MS 1000
 
 typedef enum IO_STATE_TAG
 {
@@ -306,6 +311,50 @@ static int validate_addrinfo(const ADDRINFO* addr, const char* hostname, int* er
     return result;
 }
 
+// Distinct bit per supported address family, so the connect loop can track
+// which families it has already attempted. Unsupported families map to 0 and
+// are never counted as untried; validate_addrinfo rejects them anyway.
+static unsigned int address_family_bit(int ai_family)
+{
+    unsigned int result;
+
+    if (ai_family == AF_INET)
+    {
+        result = 1u;
+    }
+    else if (ai_family == AF_INET6)
+    {
+        result = 2u;
+    }
+    else
+    {
+        result = 0u;
+    }
+
+    return result;
+}
+
+// Non-zero when some candidate after 'current' belongs to a family that has
+// neither been attempted yet nor is the family of 'current' itself.
+static int untried_family_ahead(const ADDRINFO* current, unsigned int tried_families)
+{
+    unsigned int seen = tried_families | address_family_bit(current->ai_family);
+    const ADDRINFO* rp;
+    int result = 0;
+
+    for (rp = current->ai_next; rp != NULL; rp = rp->ai_next)
+    {
+        unsigned int bit = address_family_bit(rp->ai_family);
+        if ((bit != 0) && ((bit & seen) == 0))
+        {
+            result = 1;
+            break;
+        }
+    }
+
+    return result;
+}
+
 // Attempt to connect to a single resolved address. On success returns 0 with the
 // socket open and non-blocking; on failure returns __FAILURE__, closes the socket,
 // sets it to INVALID_SOCKET, and records the Winsock error in *error_code.
@@ -324,6 +373,23 @@ static int connect_to_addrinfo(SOCKET_IO_INSTANCE* socket_io_instance, ADDRINFO*
     else
     {
         u_long nonblocking = 1;
+
+        if (addr->ai_family == AF_INET6)
+        {
+            // Windows defaults IPv6 sockets to v6-only, which rejects an
+            // IPv4-mapped destination such as ::ffff:203.0.113.1 with
+            // WSAEADDRNOTAVAIL. A client socket has no reason to refuse one,
+            // and a caller that passed a literal has no A record to fall back
+            // to. Best effort: if the stack will not allow it, carry on and let
+            // connect report the outcome.
+            DWORD v6_only = 0;
+            if (setsockopt(socket_io_instance->socket, IPPROTO_IPV6, IPV6_V6ONLY,
+                (const char*)&v6_only, sizeof(v6_only)) != 0)
+            {
+                LogInfo("Could not clear IPV6_V6ONLY for %s: error %d.", hostname, WSAGetLastError());
+            }
+        }
+
         if (ioctlsocket(socket_io_instance->socket, FIONBIO, &nonblocking) != 0)
         {
             *error_code = WSAGetLastError();
@@ -491,6 +557,10 @@ int socketio_open(CONCRETE_IO_HANDLE socket_io, ON_IO_OPEN_COMPLETE on_io_open_c
             addrHint.ai_family = AF_UNSPEC;   // was AF_INET: ask for A and AAAA
             addrHint.ai_socktype = SOCK_STREAM;
             addrHint.ai_protocol = 0;
+            // Do not hand back AAAA on a host with no global IPv6 address (nor A
+            // on a host with no global IPv4 address). Matches what OpenSSL asks
+            // for. Note Windows does not count loopback as a global address.
+            addrHint.ai_flags = AI_ADDRCONFIG;
             sprintf(portString, "%d", socket_io_instance->port);
             LogInfo("Starting DNS lookup for %s:%d", hostname, socket_io_instance->port);
             int addrResult = getaddrinfo(socket_io_instance->hostname, portString, &addrHint, &addrInfo);
@@ -511,6 +581,7 @@ int socketio_open(CONCRETE_IO_HANDLE socket_io, ON_IO_OPEN_COMPLETE on_io_open_c
                 }
                 int connect_error = __FAILURE__;
                 int remaining_timeout_ms = CONNECT_TIMEOUT_MS;
+                unsigned int tried_families = 0;
                 result = __FAILURE__;
                 for (ADDRINFO* rp = addrInfo; rp != NULL; rp = rp->ai_next, remaining_address_count--)
                 {
@@ -519,15 +590,32 @@ int socketio_open(CONCRETE_IO_HANDLE socket_io, ON_IO_OPEN_COMPLETE on_io_open_c
                         continue;
                     }
 
+                    int timeout_ms = remaining_timeout_ms;
+
+                    // Hold back enough budget for the first address of a family
+                    // that has not been attempted yet. Without this a run of
+                    // blackholed addresses in one family spends the whole budget
+                    // and the other family - often the only one that works - is
+                    // never tried at all.
+                    if (untried_family_ahead(rp, tried_families))
+                    {
+                        timeout_ms -= CONNECT_FAMILY_RESERVE_MS;
+                        if (timeout_ms < CONNECT_MIN_ATTEMPT_TIMEOUT_MS)
+                        {
+                            continue;
+                        }
+                    }
+
                     // The last remaining candidate gets the whole budget, so a
                     // single-address lookup times out exactly as it did before.
                     // While others remain, cap the attempt so one blackholed
                     // address cannot starve them.
-                    int timeout_ms = remaining_timeout_ms;
                     if ((remaining_address_count > 1) && (timeout_ms > CONNECT_ATTEMPT_TIMEOUT_MS))
                     {
                         timeout_ms = CONNECT_ATTEMPT_TIMEOUT_MS;
                     }
+
+                    tried_families |= address_family_bit(rp->ai_family);
 
                     if (connect_to_addrinfo(socket_io_instance, rp, timeout_ms, &connect_error) == 0)
                     {

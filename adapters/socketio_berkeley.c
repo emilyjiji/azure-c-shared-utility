@@ -857,6 +857,7 @@ int socketio_open(CONCRETE_IO_HANDLE socket_io, ON_IO_OPEN_COMPLETE on_io_open_c
                 addrHint.ai_family = AF_UNSPEC;
                 addrHint.ai_socktype = SOCK_STREAM;
                 addrHint.ai_protocol = 0;
+                addrHint.ai_flags = AI_ADDRCONFIG;
 
                 sprintf(portString, "%u", socket_io_instance->port);
                 LogInfo("Starting DNS lookup for %s:%d", socket_io_instance->hostname, socket_io_instance->port);

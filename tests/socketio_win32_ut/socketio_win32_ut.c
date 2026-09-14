@@ -882,7 +882,6 @@ TEST_FUNCTION(socketio_open_reserves_budget_for_untried_address_family)
     EXPECTED_CALL(getaddrinfo(IGNORED_PTR_ARG, IGNORED_PTR_ARG, &TEST_ADDR_INFO, IGNORED_PTR_ARG)).IgnoreArgument_pHints();
     // First IPv6 candidate: blackholed, so it spends its whole grant.
     EXPECTED_CALL(socket(IGNORED_NUM_ARG, IGNORED_NUM_ARG, IGNORED_NUM_ARG));
-    EXPECTED_CALL(setsockopt(IGNORED_NUM_ARG, IPPROTO_IPV6, IPV6_V6ONLY, IGNORED_PTR_ARG, IGNORED_NUM_ARG));
     EXPECTED_CALL(ioctlsocket(IGNORED_NUM_ARG, IGNORED_NUM_ARG, IGNORED_PTR_ARG));
     EXPECTED_CALL(inet_ntop(IGNORED_NUM_ARG, IGNORED_PTR_ARG, IGNORED_PTR_ARG, IGNORED_NUM_ARG));
     EXPECTED_CALL(connect(IGNORED_NUM_ARG, &test_sock_addr, IGNORED_NUM_ARG)).SetReturn(SOCKET_ERROR);

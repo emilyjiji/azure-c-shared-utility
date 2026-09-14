@@ -374,21 +374,10 @@ static int connect_to_addrinfo(SOCKET_IO_INSTANCE* socket_io_instance, ADDRINFO*
     {
         u_long nonblocking = 1;
 
-        if (addr->ai_family == AF_INET6)
-        {
-            // Windows defaults IPv6 sockets to v6-only, which rejects an
-            // IPv4-mapped destination such as ::ffff:203.0.113.1 with
-            // WSAEADDRNOTAVAIL. A client socket has no reason to refuse one,
-            // and a caller that passed a literal has no A record to fall back
-            // to. Best effort: if the stack will not allow it, carry on and let
-            // connect report the outcome.
-            DWORD v6_only = 0;
-            if (setsockopt(socket_io_instance->socket, IPPROTO_IPV6, IPV6_V6ONLY,
-                (const char*)&v6_only, sizeof(v6_only)) != 0)
-            {
-                LogInfo("Could not clear IPV6_V6ONLY for %s: error %d.", hostname, WSAGetLastError());
-            }
-        }
+        // IPV6_V6ONLY is deliberately left at the Windows default. An
+        // IPv4-mapped destination such as ::ffff:203.0.113.1 is therefore
+        // refused with WSAEADDRNOTAVAIL, which is the intended behaviour: a
+        // caller wanting IPv4 should supply an IPv4 address or a hostname.
 
         if (ioctlsocket(socket_io_instance->socket, FIONBIO, &nonblocking) != 0)
         {

@@ -701,6 +701,23 @@ static int connect_to_addrinfo(SOCKET_IO_INSTANCE* socket_io_instance, const str
                 resolved_address = &((const struct sockaddr_in6*)address->ai_addr)->sin6_addr;
             }
 
+            // An IPv4-mapped destination such as ::ffff:203.0.113.1 resolves to
+            // AF_INET6 and can only be reached from a dual-stack socket. Linux
+            // already allows this by default (net.ipv6.bindv6only=0), but the
+            // sysctl can be flipped, so set it explicitly and stay aligned with
+            // the Windows adapter. Not fatal: a failure here only means a mapped
+            // destination may be refused later.
+            if (address->ai_family == AF_INET6)
+            {
+                int v6only = 0;
+                if (setsockopt(socket_io_instance->socket, IPPROTO_IPV6, IPV6_V6ONLY,
+                    &v6only, sizeof(v6only)) != 0)
+                {
+                    LogInfo("Could not clear IPV6_V6ONLY (%d) for %s; IPv4-mapped destinations may be refused.",
+                        errno, socket_io_instance->hostname);
+                }
+            }
+
             if ((resolved_address != NULL) &&
                 (inet_ntop(address->ai_family, resolved_address, resolved_ip, sizeof(resolved_ip)) != NULL))
             {
@@ -856,7 +873,12 @@ int socketio_open(CONCRETE_IO_HANDLE socket_io, ON_IO_OPEN_COMPLETE on_io_open_c
                 addrHint.ai_family = AF_UNSPEC;
                 addrHint.ai_socktype = SOCK_STREAM;
                 addrHint.ai_protocol = 0;
-                addrHint.ai_flags = AI_ADDRCONFIG;
+                // ai_flags is deliberately left clear. AI_ADDRCONFIG would suppress
+                // AAAA results on a host with no global IPv6, but glibc does not
+                // count loopback when making that decision, so it also makes the
+                // literal "::1" unresolvable (EAI_ADDRFAMILY). The attempts it would
+                // save are nearly free anyway: with no IPv6 route a connect fails
+                // immediately with ENETUNREACH rather than timing out.
 
                 sprintf(portString, "%u", socket_io_instance->port);
                 LogInfo("Starting DNS lookup for %s:%d", socket_io_instance->hostname, socket_io_instance->port);

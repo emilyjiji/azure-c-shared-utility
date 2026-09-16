@@ -863,16 +863,17 @@ TEST_FUNCTION(socketio_open_timeout_falls_back_to_next_address)
 
     ASSERT_ARE_EQUAL(int, 0, result);
     ASSERT_ARE_EQUAL(int, IO_OPEN_OK, g_open_result.result);
-    ASSERT_ARE_EQUAL(int, 5000, g_last_select_timeout_ms);
+    /* Both candidates are granted the full per-address timeout; there is no
+       shared budget to divide between them. */
+    ASSERT_ARE_EQUAL(int, 10000, g_last_select_timeout_ms);
     ASSERT_ARE_EQUAL(char_ptr, umock_c_get_expected_calls(), umock_c_get_actual_calls());
 
     socketio_destroy(ioHandle);
 }
 
-/* Several blackholed candidates of one family must not consume the whole
-   connect budget: a family that has not been tried yet - typically the one that
-   actually works - still has to get an attempt. */
-TEST_FUNCTION(socketio_open_reserves_budget_for_untried_address_family)
+/* No budget is shared across candidates, so however many blackholed addresses
+   of one family come first, the family behind them still gets its attempt. */
+TEST_FUNCTION(socketio_open_reaches_ipv4_after_blackholed_ipv6_candidates)
 {
     SOCKETIO_CONFIG socketConfig = { HOSTNAME_ARG, PORT_NUM, NULL };
     CONCRETE_IO_HANDLE ioHandle = socketio_create(&socketConfig);
@@ -880,7 +881,7 @@ TEST_FUNCTION(socketio_open_reserves_budget_for_untried_address_family)
     umock_c_reset_all_calls();
 
     EXPECTED_CALL(getaddrinfo(IGNORED_PTR_ARG, IGNORED_PTR_ARG, &TEST_ADDR_INFO, IGNORED_PTR_ARG)).IgnoreArgument_pHints();
-    // First IPv6 candidate: blackholed, so it spends its whole grant.
+    // First IPv6 candidate: blackholed, spends its full grant.
     EXPECTED_CALL(socket(IGNORED_NUM_ARG, IGNORED_NUM_ARG, IGNORED_NUM_ARG));
     EXPECTED_CALL(ioctlsocket(IGNORED_NUM_ARG, IGNORED_NUM_ARG, IGNORED_PTR_ARG));
     EXPECTED_CALL(inet_ntop(IGNORED_NUM_ARG, IGNORED_PTR_ARG, IGNORED_PTR_ARG, IGNORED_NUM_ARG));
@@ -888,8 +889,14 @@ TEST_FUNCTION(socketio_open_reserves_budget_for_untried_address_family)
     EXPECTED_CALL(WSAGetLastError()).SetReturn(WSAEWOULDBLOCK);
     EXPECTED_CALL(select(0, NULL, IGNORED_PTR_ARG, IGNORED_PTR_ARG, IGNORED_PTR_ARG)).SetReturn(0);
     EXPECTED_CALL(closesocket(IGNORED_NUM_ARG));
-    // The second IPv6 candidate is skipped: attempting it would leave nothing
-    // for the IPv4 candidate behind it.
+    // Second IPv6 candidate: also blackholed, and also gets a full grant.
+    EXPECTED_CALL(socket(IGNORED_NUM_ARG, IGNORED_NUM_ARG, IGNORED_NUM_ARG));
+    EXPECTED_CALL(ioctlsocket(IGNORED_NUM_ARG, IGNORED_NUM_ARG, IGNORED_PTR_ARG));
+    EXPECTED_CALL(inet_ntop(IGNORED_NUM_ARG, IGNORED_PTR_ARG, IGNORED_PTR_ARG, IGNORED_NUM_ARG));
+    EXPECTED_CALL(connect(IGNORED_NUM_ARG, &test_sock_addr, IGNORED_NUM_ARG)).SetReturn(SOCKET_ERROR);
+    EXPECTED_CALL(WSAGetLastError()).SetReturn(WSAEWOULDBLOCK);
+    EXPECTED_CALL(select(0, NULL, IGNORED_PTR_ARG, IGNORED_PTR_ARG, IGNORED_PTR_ARG)).SetReturn(0);
+    EXPECTED_CALL(closesocket(IGNORED_NUM_ARG));
     // IPv4 candidate: still reached, and connects.
     EXPECTED_CALL(socket(IGNORED_NUM_ARG, IGNORED_NUM_ARG, IGNORED_NUM_ARG));
     EXPECTED_CALL(ioctlsocket(IGNORED_NUM_ARG, IGNORED_NUM_ARG, IGNORED_PTR_ARG));
@@ -902,9 +909,12 @@ TEST_FUNCTION(socketio_open_reserves_budget_for_untried_address_family)
 
     ASSERT_ARE_EQUAL(int, 0, result);
     ASSERT_ARE_EQUAL(int, IO_OPEN_OK, g_open_result.result);
-    ASSERT_ARE_EQUAL(size_t, (size_t)2, g_connect_attempt_count);
+    ASSERT_ARE_EQUAL(size_t, (size_t)3, g_connect_attempt_count);
     ASSERT_ARE_EQUAL(int, AF_INET6, g_connect_families[0]);
-    ASSERT_ARE_EQUAL(int, AF_INET, g_connect_families[1]);
+    ASSERT_ARE_EQUAL(int, AF_INET6, g_connect_families[1]);
+    ASSERT_ARE_EQUAL(int, AF_INET, g_connect_families[2]);
+    /* Each candidate is granted the full per-address timeout. */
+    ASSERT_ARE_EQUAL(int, 10000, g_last_select_timeout_ms);
     ASSERT_ARE_EQUAL(char_ptr, umock_c_get_expected_calls(), umock_c_get_actual_calls());
 
     socketio_destroy(ioHandle);

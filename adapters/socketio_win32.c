@@ -17,16 +17,10 @@
 #include "azure_c_shared_utility/xlogging.h"
 #include "azure_c_shared_utility/safe_math.h"
 
-// Overall budget for opening a connection, across every resolved address.
+// Time allowed for a connect attempt against a single resolved address. There
+// is no budget shared across addresses: each candidate gets this in full, so a
+// blackholed address cannot deny the ones behind it their attempt.
 #define CONNECT_TIMEOUT_MS 10000
-// Cap on a single attempt while other candidates remain, so one blackholed
-// address cannot consume the whole budget.
-#define CONNECT_ATTEMPT_TIMEOUT_MS 5000
-// Held back for the first address of a family that has not been attempted yet.
-#define CONNECT_FAMILY_RESERVE_MS 5000
-// An attempt granted less than this is not worth making; the budget is better
-// spent on the untried family behind it.
-#define CONNECT_MIN_ATTEMPT_TIMEOUT_MS 1000
 
 typedef enum IO_STATE_TAG
 {
@@ -311,50 +305,6 @@ static int validate_addrinfo(const ADDRINFO* addr, const char* hostname, int* er
     return result;
 }
 
-// Distinct bit per supported address family, so the connect loop can track
-// which families it has already attempted. Unsupported families map to 0 and
-// are never counted as untried; validate_addrinfo rejects them anyway.
-static unsigned int address_family_bit(int ai_family)
-{
-    unsigned int result;
-
-    if (ai_family == AF_INET)
-    {
-        result = 1u;
-    }
-    else if (ai_family == AF_INET6)
-    {
-        result = 2u;
-    }
-    else
-    {
-        result = 0u;
-    }
-
-    return result;
-}
-
-// Non-zero when some candidate after 'current' belongs to a family that has
-// neither been attempted yet nor is the family of 'current' itself.
-static int untried_family_ahead(const ADDRINFO* current, unsigned int tried_families)
-{
-    unsigned int seen = tried_families | address_family_bit(current->ai_family);
-    const ADDRINFO* rp;
-    int result = 0;
-
-    for (rp = current->ai_next; rp != NULL; rp = rp->ai_next)
-    {
-        unsigned int bit = address_family_bit(rp->ai_family);
-        if ((bit != 0) && ((bit & seen) == 0))
-        {
-            result = 1;
-            break;
-        }
-    }
-
-    return result;
-}
-
 // Attempt to connect to a single resolved address. On success returns 0 with the
 // socket open and non-blocking; on failure returns __FAILURE__, closes the socket,
 // sets it to INVALID_SOCKET, and records the Winsock error in *error_code.
@@ -563,65 +513,25 @@ int socketio_open(CONCRETE_IO_HANDLE socket_io, ON_IO_OPEN_COMPLETE on_io_open_c
             {
                 // getaddrinfo can return several addresses (e.g. AAAA then A).
                 // Try each in turn and keep the first that connects.
-                size_t remaining_address_count = 0;
-                for (ADDRINFO* rp = addrInfo; rp != NULL; rp = rp->ai_next)
-                {
-                    remaining_address_count++;
-                }
                 int connect_error = __FAILURE__;
-                int remaining_timeout_ms = CONNECT_TIMEOUT_MS;
-                unsigned int tried_families = 0;
                 result = __FAILURE__;
-                for (ADDRINFO* rp = addrInfo; rp != NULL; rp = rp->ai_next, remaining_address_count--)
+                for (ADDRINFO* rp = addrInfo; rp != NULL; rp = rp->ai_next)
                 {
                     if (validate_addrinfo(rp, hostname, &connect_error) != 0)
                     {
                         continue;
                     }
 
-                    int timeout_ms = remaining_timeout_ms;
-
-                    // Hold back enough budget for the first address of a family
-                    // that has not been attempted yet. Without this a run of
-                    // blackholed addresses in one family spends the whole budget
-                    // and the other family - often the only one that works - is
-                    // never tried at all.
-                    if (untried_family_ahead(rp, tried_families))
-                    {
-                        timeout_ms -= CONNECT_FAMILY_RESERVE_MS;
-                        if (timeout_ms < CONNECT_MIN_ATTEMPT_TIMEOUT_MS)
-                        {
-                            continue;
-                        }
-                    }
-
-                    // The last remaining candidate gets the whole budget, so a
-                    // single-address lookup times out exactly as it did before.
-                    // While others remain, cap the attempt so one blackholed
-                    // address cannot starve them.
-                    if ((remaining_address_count > 1) && (timeout_ms > CONNECT_ATTEMPT_TIMEOUT_MS))
-                    {
-                        timeout_ms = CONNECT_ATTEMPT_TIMEOUT_MS;
-                    }
-
-                    tried_families |= address_family_bit(rp->ai_family);
-
-                    if (connect_to_addrinfo(socket_io_instance, rp, timeout_ms, &connect_error) == 0)
+                    // Every candidate gets the same full grant. There is no
+                    // budget shared across addresses, so a run of blackholed
+                    // addresses in one family cannot exhaust the allowance and
+                    // leave the other family - often the only one that works -
+                    // unattempted. The cost is that the worst case grows with
+                    // the number of resolved addresses rather than being capped.
+                    if (connect_to_addrinfo(socket_io_instance, rp, CONNECT_TIMEOUT_MS, &connect_error) == 0)
                     {
                         result = 0;
                         break;
-                    }
-
-                    // Only an attempt that ran out its grant consumes the budget.
-                    // A refused or unreachable address returns immediately and must
-                    // not cost the addresses behind it their chance to connect.
-                    if (connect_error == WSAETIMEDOUT)
-                    {
-                        remaining_timeout_ms -= timeout_ms;
-                        if (remaining_timeout_ms <= 0)
-                        {
-                            break;
-                        }
                     }
                 }
 

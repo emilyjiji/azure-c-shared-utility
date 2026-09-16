@@ -56,11 +56,10 @@
 #endif
 
 #define CONNECT_TIMEOUT_SECONDS 10
-// Overall budget for opening a connection, across every resolved address.
+// Time allowed for a connect attempt against a single resolved address. There
+// is no budget shared across addresses: each candidate gets this in full, so a
+// blackholed address cannot deny the ones behind it their attempt.
 #define CONNECT_TIMEOUT_MS (CONNECT_TIMEOUT_SECONDS * 1000)
-// Cap on a single attempt while other candidates remain, so one blackholed
-// address cannot consume the whole budget.
-#define CONNECT_ATTEMPT_TIMEOUT_MS 5000
 #define SOCKETIO_POLL_TIMEOUT_ERROR 110  /* ETIMEDOUT equivalent for poll timeout */
 
 typedef enum IO_STATE_TAG
@@ -870,52 +869,27 @@ int socketio_open(CONCRETE_IO_HANDLE socket_io, ON_IO_OPEN_COMPLETE on_io_open_c
                 }
                 else
                 {
-                    size_t remaining_address_count = 0;
                     int connect_error = __FAILURE__;
-                    int remaining_timeout_ms = CONNECT_TIMEOUT_MS;
                     struct addrinfo* address;
 
+                    result = __FAILURE__;
                     for (address = addrInfo; address != NULL; address = address->ai_next)
                     {
-                        remaining_address_count++;
-                    }
-
-                    result = __FAILURE__;
-                    for (address = addrInfo; address != NULL; address = address->ai_next, remaining_address_count--)
-                    {
-                        int timeout_ms;
-
                         if (validate_addrinfo(address, socket_io_instance->hostname, &connect_error) != 0)
                         {
                             continue;
                         }
 
-                        // The last remaining candidate gets the whole budget, so a
-                        // single-address lookup times out exactly as it did before.
-                        // While others remain, cap the attempt so one blackholed
-                        // address cannot starve them.
-                        timeout_ms = remaining_timeout_ms;
-                        if ((remaining_address_count > 1) && (timeout_ms > CONNECT_ATTEMPT_TIMEOUT_MS))
-                        {
-                            timeout_ms = CONNECT_ATTEMPT_TIMEOUT_MS;
-                        }
-
-                        if (connect_to_addrinfo(socket_io_instance, address, timeout_ms, &connect_error) == 0)
+                        // Every candidate gets the same full grant. There is no
+                        // budget shared across addresses, so a run of blackholed
+                        // addresses in one family cannot exhaust the allowance and
+                        // leave the other family - often the only one that works -
+                        // unattempted. The cost is that the worst case grows with
+                        // the number of resolved addresses rather than being capped.
+                        if (connect_to_addrinfo(socket_io_instance, address, CONNECT_TIMEOUT_MS, &connect_error) == 0)
                         {
                             result = 0;
                             break;
-                        }
-
-                        // Only an attempt that ran out its grant consumes the budget.
-                        // A refused or unreachable address returns immediately and must
-                        // not cost the addresses behind it their chance to connect.
-                        if (connect_error == SOCKETIO_POLL_TIMEOUT_ERROR)
-                        {
-                            remaining_timeout_ms -= timeout_ms;
-                            if (remaining_timeout_ms <= 0)
-                            {
-                                break;
-                            }
                         }
                     }
 

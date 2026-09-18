@@ -2,6 +2,7 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 #include <stdlib.h>
+#include <string.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <limits.h>
@@ -10,6 +11,7 @@
 #include <windows.h>
 #include <mstcpip.h>
 #include "azure_c_shared_utility/socketio.h"
+#include "azure_c_shared_utility/shared_util_options.h"
 #include "azure_c_shared_utility/singlylinkedlist.h"
 #include "azure_c_shared_utility/gballoc.h"
 #include "azure_c_shared_utility/gbnetwork.h"
@@ -48,6 +50,7 @@ typedef struct SOCKET_IO_INSTANCE_TAG
     void* on_io_error_context;
     char* hostname;
     int port;
+    int enable_ipv6;
     IO_STATE io_state;
     SINGLYLINKEDLIST_HANDLE pending_io_list;
     struct tcp_keepalive keep_alive;
@@ -208,6 +211,7 @@ CONCRETE_IO_HANDLE socketio_create(void* io_create_parameters)
                 else
                 {
                     result->port = socket_io_config->port;
+                    result->enable_ipv6 = socket_io_config->enable_ipv6;
                     result->on_bytes_received = NULL;
                     result->on_io_error = NULL;
                     result->on_bytes_received_context = NULL;
@@ -259,6 +263,16 @@ void socketio_destroy(CONCRETE_IO_HANDLE socket_io)
 
         free(socket_io);
     }
+}
+
+// An IPv6 literal is an explicit request for a specific address, so it is
+// honoured even when the IPv6 opt-in is off - that opt-in governs how
+// hostnames are resolved, not whether an address the caller supplied is
+// usable. A colon cannot appear in a DNS name or an IPv4 literal, which is
+// the same test host_utils.c uses.
+static int hostname_is_ipv6_literal(const char* hostname)
+{
+    return ((hostname != NULL) && (strchr(hostname, ':') != NULL)) ? 1 : 0;
 }
 
 // Rejects a resolved address that cannot safely be handed to socket() and
@@ -505,13 +519,17 @@ int socketio_open(CONCRETE_IO_HANDLE socket_io, ON_IO_OPEN_COMPLETE on_io_open_c
             ADDRINFO addrHint = { 0 };
             ADDRINFO* addrInfo = NULL;
 
-            addrHint.ai_family = AF_UNSPEC;   // was AF_INET: ask for A and AAAA
+            // AF_UNSPEC asks for A and AAAA; AF_INET restores the IPv4-only
+            // lookup this adapter did before IPv6 support was added.
+            addrHint.ai_family = ((socket_io_instance->enable_ipv6 != 0) ||
+                hostname_is_ipv6_literal(socket_io_instance->hostname)) ? AF_UNSPEC : AF_INET;
             addrHint.ai_socktype = SOCK_STREAM;
             addrHint.ai_protocol = 0;
-            // Do not hand back AAAA on a host with no global IPv6 address (nor A
-            // on a host with no global IPv4 address). Matches what OpenSSL asks
-            // for. Note Windows does not count loopback as a global address.
-            addrHint.ai_flags = AI_ADDRCONFIG;
+            // ai_flags is deliberately left clear, matching socketio_berkeley.c.
+            // AI_ADDRCONFIG is measured to suppress AAAA on glibc whenever the host
+            // has no non-loopback IPv6 address, putting even "::1" out of reach; the
+            // Winsock threshold is unverified. Either way the flag buys nothing here,
+            // since ai_family already names the families the caller asked for.
             sprintf(portString, "%d", socket_io_instance->port);
             LogInfo("Starting DNS lookup for %s:%d", hostname, socket_io_instance->port);
             int addrResult = getaddrinfo(socket_io_instance->hostname, portString, &addrHint, &addrInfo);
@@ -810,7 +828,14 @@ int socketio_setoption(CONCRETE_IO_HANDLE socket_io, const char* optionName, con
     {
         SOCKET_IO_INSTANCE* socket_io_instance = (SOCKET_IO_INSTANCE*)socket_io;
 
-        if (strcmp(optionName, "tcp_keepalive") == 0)
+        if (strcmp(optionName, OPTION_ENABLE_IPV6) == 0)
+        {
+            /* Read when the connection is opened, so setting it after that has
+               no effect on an already resolved address. */
+            socket_io_instance->enable_ipv6 = *(const int*)value;
+            result = 0;
+        }
+        else if (strcmp(optionName, "tcp_keepalive") == 0)
         {
             struct tcp_keepalive keepAlive = socket_io_instance->keep_alive;
             keepAlive.onoff = *(int *)value;

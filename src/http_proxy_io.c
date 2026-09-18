@@ -171,6 +171,8 @@ static CONCRETE_IO_HANDLE http_proxy_io_create(void* io_create_parameters)
                                     socket_io_config.hostname = http_proxy_io_config->proxy_hostname;
                                     socket_io_config.port = http_proxy_io_config->proxy_port;
                                     socket_io_config.accepted_socket = NULL;
+                                    /* No opt-in plumbed to this path yet; keep the pre-IPv6 IPv4-only lookup. */
+                                    socket_io_config.enable_ipv6 = 0;
 
                                     /* Codes_SRS_HTTP_PROXY_IO_01_009: [ `http_proxy_io_create` shall create a new socket IO by calling `xio_create` with the arguments: ]*/
                                     result->underlying_io = xio_create(underlying_io_interface, &socket_io_config);

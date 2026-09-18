@@ -202,6 +202,7 @@ UWS_CLIENT_HANDLE uws_client_create(const char* hostname, unsigned int port, con
                             if (use_ssl == true)
                             {
                                 TLSIO_CONFIG tlsio_config;
+                                tlsio_config.enable_ipv6 = 0;
 
                                 /* Codes_SRS_UWS_CLIENT_01_006: [ If `use_ssl` is true then `uws_client_create` shall obtain the interface used to create a tlsio instance by calling `platform_get_default_tlsio`. ]*/
                                 /* Codes_SRS_UWS_CLIENT_01_076: [ If /secure/ is true, the client MUST perform a TLS handshake over the connection after opening the connection and before sending the handshake data [RFC2818]. ]*/
@@ -222,6 +223,8 @@ UWS_CLIENT_HANDLE uws_client_create(const char* hostname, unsigned int port, con
                                     socketio_config.hostname = hostname;
                                     socketio_config.port = port;
                                     socketio_config.accepted_socket = NULL;
+                                    /* No opt-in plumbed to this path yet; keep the pre-IPv6 IPv4-only lookup. */
+                                    socketio_config.enable_ipv6 = 0;
 
                                     tlsio_config.hostname = hostname;
                                     tlsio_config.port = port;
@@ -254,6 +257,8 @@ UWS_CLIENT_HANDLE uws_client_create(const char* hostname, unsigned int port, con
                                     socketio_config.hostname = hostname;
                                     socketio_config.port = port;
                                     socketio_config.accepted_socket = NULL;
+                                    /* No opt-in plumbed to this path yet; keep the pre-IPv6 IPv4-only lookup. */
+                                    socketio_config.enable_ipv6 = 0;
 
                                     /* Codes_SRS_UWS_CLIENT_01_008: [ The obtained interface shall be used to create the IO used as underlying IO by the newly created uws instance. ]*/
                                     /* Codes_SRS_UWS_CLIENT_01_009: [ The underlying IO shall be created by calling `xio_create`. ]*/

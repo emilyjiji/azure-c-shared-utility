@@ -89,6 +89,7 @@ typedef struct SOCKET_IO_INSTANCE_TAG
     void* on_io_error_context;
     char* hostname;
     int port;
+    int enable_ipv6;
     char* target_mac_address;
     IO_STATE io_state;
     SINGLYLINKEDLIST_HANDLE pending_io_list;
@@ -563,6 +564,7 @@ CONCRETE_IO_HANDLE socketio_create(void* io_create_parameters)
                 else
                 {
                     result->port = socket_io_config->port;
+                    result->enable_ipv6 = socket_io_config->enable_ipv6;
                     result->target_mac_address = NULL;
                     result->on_bytes_received = NULL;
                     result->on_io_error = NULL;
@@ -612,6 +614,16 @@ void socketio_destroy(CONCRETE_IO_HANDLE socket_io)
         free(socket_io_instance->target_mac_address);
         free(socket_io);
     }
+}
+
+// An IPv6 literal is an explicit request for a specific address, so it is
+// honoured even when the IPv6 opt-in is off - that opt-in governs how
+// hostnames are resolved, not whether an address the caller supplied is
+// usable. A colon cannot appear in a DNS name or an IPv4 literal, which is
+// the same test host_utils.c uses.
+static int hostname_is_ipv6_literal(const char* hostname)
+{
+    return ((hostname != NULL) && (strchr(hostname, ':') != NULL)) ? 1 : 0;
 }
 
 // Rejects a resolved address that cannot safely be handed to socket() and
@@ -870,14 +882,17 @@ int socketio_open(CONCRETE_IO_HANDLE socket_io, ON_IO_OPEN_COMPLETE on_io_open_c
             else
             {
                 struct addrinfo addrHint = { 0 };
-                addrHint.ai_family = AF_UNSPEC;
+                // AF_UNSPEC asks for A and AAAA; AF_INET restores the IPv4-only
+                // lookup this adapter did before IPv6 support was added.
+                addrHint.ai_family = ((socket_io_instance->enable_ipv6 != 0) ||
+                    hostname_is_ipv6_literal(socket_io_instance->hostname)) ? AF_UNSPEC : AF_INET;
                 addrHint.ai_socktype = SOCK_STREAM;
                 addrHint.ai_protocol = 0;
-                // ai_flags is deliberately left clear. AI_ADDRCONFIG would suppress
-                // AAAA results on a host with no global IPv6, but glibc does not
-                // count loopback when making that decision, so it also makes the
-                // literal "::1" unresolvable (EAI_ADDRFAMILY). The attempts it would
-                // save are nearly free anyway: with no IPv6 route a connect fails
+                // ai_flags is deliberately left clear. AI_ADDRCONFIG suppresses AAAA
+                // whenever the host has no non-loopback IPv6 address - glibc does not
+                // count loopback - which puts even the literal "::1" out of reach
+                // (EAI_ADDRFAMILY) and demotes "::ffff:127.0.0.1" to AF_INET. What it
+                // saves is nearly nothing: with no IPv6 route a connect fails
                 // immediately with ENETUNREACH rather than timing out.
 
                 sprintf(portString, "%u", socket_io_instance->port);
@@ -1200,7 +1215,14 @@ int socketio_setoption(CONCRETE_IO_HANDLE socket_io, const char* optionName, con
     {
         SOCKET_IO_INSTANCE* socket_io_instance = (SOCKET_IO_INSTANCE*)socket_io;
 
-        if (strcmp(optionName, "tcp_keepalive") == 0)
+        if (strcmp(optionName, OPTION_ENABLE_IPV6) == 0)
+        {
+            /* Read when the connection is opened, so setting it after that has
+               no effect on an already resolved address. */
+            socket_io_instance->enable_ipv6 = *(const int*)value;
+            result = 0;
+        }
+        else if (strcmp(optionName, "tcp_keepalive") == 0)
         {
             result = setsockopt(socket_io_instance->socket, SOL_SOCKET, SO_KEEPALIVE, value, sizeof(int));
             if (result == -1) result = errno;

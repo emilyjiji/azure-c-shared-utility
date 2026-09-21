@@ -41,6 +41,8 @@ extern "C"
 }
 #endif
 
+#include "azure_c_shared_utility/shared_util_options.h"
+
 #define ENABLE_MOCKS
 
 #include "azure_c_shared_utility/gballoc.h"
@@ -1600,6 +1602,55 @@ TEST_FUNCTION(when_the_underlying_xio_setoption_fails_http_proxy_io_set_option_a
 
     // act
     result = http_proxy_io_get_interface_description()->concrete_io_setoption(http_io, "option_1", "test");
+
+    // assert
+    ASSERT_ARE_NOT_EQUAL(int, 0, result);
+    ASSERT_ARE_EQUAL(char_ptr, umock_c_get_expected_calls(), umock_c_get_actual_calls());
+
+    // cleanup
+    http_proxy_io_get_interface_description()->concrete_io_destroy(http_io);
+}
+
+/* Tests_SRS_HTTP_PROXY_IO_01_043: [ If the `option_name` argument indicates an option that is not handled by `http_proxy_io_set_option`, then `xio_setoption` shall be called on the underlying IO created in `http_proxy_io_create`, passing the option name and value to it. ]*/
+TEST_FUNCTION(http_proxy_io_set_option_passes_enable_ipv6_to_the_underlying_io)
+{
+    // arrange
+    CONCRETE_IO_HANDLE http_io;
+    int enable_ipv6 = 1;
+    int result;
+
+    http_io = http_proxy_io_get_interface_description()->concrete_io_create((void*)&default_http_proxy_io_config);
+    umock_c_reset_all_calls();
+
+    STRICT_EXPECTED_CALL(xio_setoption(TEST_IO_HANDLE, OPTION_ENABLE_IPV6, &enable_ipv6));
+
+    // act
+    result = http_proxy_io_get_interface_description()->concrete_io_setoption(http_io, OPTION_ENABLE_IPV6, &enable_ipv6);
+
+    // assert
+    ASSERT_ARE_EQUAL(int, 0, result);
+    ASSERT_ARE_EQUAL(char_ptr, umock_c_get_expected_calls(), umock_c_get_actual_calls());
+
+    // cleanup
+    http_proxy_io_get_interface_description()->concrete_io_destroy(http_io);
+}
+
+/* Tests_SRS_HTTP_PROXY_IO_01_044: [ if `xio_setoption` fails, `http_proxy_io_set_option` shall return a non-zero value. ]*/
+TEST_FUNCTION(when_the_underlying_io_rejects_enable_ipv6_http_proxy_io_set_option_fails)
+{
+    // arrange
+    CONCRETE_IO_HANDLE http_io;
+    int enable_ipv6 = 1;
+    int result;
+
+    http_io = http_proxy_io_get_interface_description()->concrete_io_create((void*)&default_http_proxy_io_config);
+    umock_c_reset_all_calls();
+
+    STRICT_EXPECTED_CALL(xio_setoption(TEST_IO_HANDLE, OPTION_ENABLE_IPV6, &enable_ipv6))
+        .SetReturn(1);
+
+    // act
+    result = http_proxy_io_get_interface_description()->concrete_io_setoption(http_io, OPTION_ENABLE_IPV6, &enable_ipv6);
 
     // assert
     ASSERT_ARE_NOT_EQUAL(int, 0, result);

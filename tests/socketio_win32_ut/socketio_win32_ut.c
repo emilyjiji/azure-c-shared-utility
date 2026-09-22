@@ -54,6 +54,7 @@ void my_gballoc_free(void* ptr)
 
 #include "azure_c_shared_utility/optimize_size.h"
 #include "azure_c_shared_utility/socketio.h"
+#include "azure_c_shared_utility/shared_util_options.h"
 
 #define ENABLE_MOCKS
 
@@ -62,6 +63,8 @@ void my_gballoc_free(void* ptr)
 #include "azure_c_shared_utility/singlylinkedlist.h"
 static bool g_addrinfo_call_fail;
 static bool g_addrinfo_two_addresses;
+/* Captures the resolver contract instead of trusting an ignored mock argument. */
+static int g_addrinfo_hint_family;
 /* When set, getaddrinfo returns two IPv6 candidates ahead of one IPv4
    candidate - the ordering a real resolver commonly returns for a dual-stack
    host. */
@@ -144,6 +147,7 @@ len = g_socket_send_size_value;
 MOCK_FUNCTION_END(len)
 MOCK_FUNCTION_WITH_CODE(WSAAPI, INT, getaddrinfo, PCSTR, pNodeName, PCSTR, pServiceName, const ADDRINFOA*, pHints, PADDRINFOA*, ppResult)
 int callFail;
+g_addrinfo_hint_family = (pHints == NULL) ? AF_UNSPEC : pHints->ai_family;
 if (!g_addrinfo_call_fail)
 {
     *ppResult = (PADDRINFOA)malloc(sizeof(ADDRINFOA));
@@ -475,6 +479,7 @@ TEST_FUNCTION_INITIALIZE(method_init)
     g_addrinfo_call_fail = false;
     g_addrinfo_two_addresses = false;
     g_addrinfo_dual_stack = false;
+    g_addrinfo_hint_family = AF_UNSPEC;
     g_last_select_timeout_ms = 0;
     g_connect_attempt_count = 0;
     memset(g_connect_families, 0, sizeof(g_connect_families));
@@ -751,6 +756,111 @@ TEST_FUNCTION(socketio_open_succeeds)
 
     // cleanup
     socketio_destroy(ioHandle);
+}
+
+/* Resolver-hint tests deliberately inspect the hint observed by the getaddrinfo
+   hook.  A successful IPv4 mock result alone would not distinguish AF_INET
+   from AF_UNSPEC. */
+static void open_and_assert_resolver_family(CONCRETE_IO_HANDLE ioHandle, int expected_family)
+{
+    int result;
+
+    umock_c_reset_all_calls();
+    EXPECTED_CALL(getaddrinfo(IGNORED_PTR_ARG, IGNORED_PTR_ARG, &TEST_ADDR_INFO, IGNORED_PTR_ARG)).IgnoreArgument_pHints();
+    EXPECTED_CALL(socket(IGNORED_NUM_ARG, IGNORED_NUM_ARG, IGNORED_NUM_ARG));
+    EXPECTED_CALL(ioctlsocket(IGNORED_NUM_ARG, IGNORED_NUM_ARG, IGNORED_PTR_ARG));
+    EXPECTED_CALL(inet_ntop(IGNORED_NUM_ARG, IGNORED_PTR_ARG, IGNORED_PTR_ARG, IGNORED_NUM_ARG));
+    EXPECTED_CALL(connect(IGNORED_NUM_ARG, &test_sock_addr, IGNORED_NUM_ARG));
+    EXPECTED_CALL(freeaddrinfo(&TEST_ADDR_INFO)).IgnoreArgument_pResult();
+
+    result = socketio_open(ioHandle, test_on_io_open_complete, &callbackContext,
+        test_on_bytes_received, &callbackContext, test_on_io_error, &callbackContext);
+
+    ASSERT_ARE_EQUAL(int, 0, result);
+    ASSERT_ARE_EQUAL(int, IO_OPEN_OK, g_open_result.result);
+    ASSERT_ARE_EQUAL(int, expected_family, g_addrinfo_hint_family);
+    ASSERT_ARE_EQUAL(char_ptr, umock_c_get_expected_calls(), umock_c_get_actual_calls());
+}
+
+TEST_FUNCTION(socketio_open_default_ipv6_option_uses_AF_INET)
+{
+    SOCKETIO_CONFIG socketConfig = { HOSTNAME_ARG, PORT_NUM, NULL, 0 };
+    CONCRETE_IO_HANDLE ioHandle = socketio_create(&socketConfig);
+
+    open_and_assert_resolver_family(ioHandle, AF_INET);
+
+    socketio_destroy(ioHandle);
+}
+
+TEST_FUNCTION(socketio_open_explicit_false_ipv6_option_uses_AF_INET)
+{
+    int enable_ipv6 = 0;
+    SOCKETIO_CONFIG socketConfig = { HOSTNAME_ARG, PORT_NUM, NULL, 1 };
+    CONCRETE_IO_HANDLE ioHandle = socketio_create(&socketConfig);
+
+    ASSERT_ARE_EQUAL(int, 0, socketio_setoption(ioHandle, OPTION_ENABLE_IPV6, &enable_ipv6));
+    open_and_assert_resolver_family(ioHandle, AF_INET);
+
+    socketio_destroy(ioHandle);
+}
+
+TEST_FUNCTION(socketio_open_explicit_true_ipv6_option_uses_AF_UNSPEC)
+{
+    int enable_ipv6 = 1;
+    SOCKETIO_CONFIG socketConfig = { HOSTNAME_ARG, PORT_NUM, NULL, 0 };
+    CONCRETE_IO_HANDLE ioHandle = socketio_create(&socketConfig);
+
+    ASSERT_ARE_EQUAL(int, 0, socketio_setoption(ioHandle, OPTION_ENABLE_IPV6, &enable_ipv6));
+    open_and_assert_resolver_family(ioHandle, AF_UNSPEC);
+
+    socketio_destroy(ioHandle);
+}
+
+TEST_FUNCTION(socketio_open_ipv6_option_changes_between_separate_opens)
+{
+    int enable_ipv6 = 1;
+    SOCKETIO_CONFIG socketConfig = { HOSTNAME_ARG, PORT_NUM, NULL, 0 };
+    CONCRETE_IO_HANDLE ioHandle = socketio_create(&socketConfig);
+
+    open_and_assert_resolver_family(ioHandle, AF_INET);
+
+    umock_c_reset_all_calls();
+    EXPECTED_CALL(closesocket(IGNORED_NUM_ARG));
+    ASSERT_ARE_EQUAL(int, 0, socketio_close(ioHandle, NULL, NULL));
+    ASSERT_ARE_EQUAL(char_ptr, umock_c_get_expected_calls(), umock_c_get_actual_calls());
+
+    ASSERT_ARE_EQUAL(int, 0, socketio_setoption(ioHandle, OPTION_ENABLE_IPV6, &enable_ipv6));
+    open_and_assert_resolver_family(ioHandle, AF_UNSPEC);
+
+    socketio_destroy(ioHandle);
+}
+
+TEST_FUNCTION(socketio_open_ipv4_and_localhost_literals_keep_the_default_AF_INET_hint)
+{
+    const char* hosts[] = { "127.0.0.1", "localhost" };
+    size_t i;
+
+    for (i = 0; i < sizeof(hosts) / sizeof(hosts[0]); i++)
+    {
+        SOCKETIO_CONFIG socketConfig = { hosts[i], PORT_NUM, NULL, 0 };
+        CONCRETE_IO_HANDLE ioHandle = socketio_create(&socketConfig);
+        open_and_assert_resolver_family(ioHandle, AF_INET);
+        socketio_destroy(ioHandle);
+    }
+}
+
+TEST_FUNCTION(socketio_open_ipv6_and_mapped_literals_use_AF_UNSPEC_without_opt_in)
+{
+    const char* hosts[] = { "::1", "::ffff:127.0.0.1" };
+    size_t i;
+
+    for (i = 0; i < sizeof(hosts) / sizeof(hosts[0]); i++)
+    {
+        SOCKETIO_CONFIG socketConfig = { hosts[i], PORT_NUM, NULL, 0 };
+        CONCRETE_IO_HANDLE ioHandle = socketio_create(&socketConfig);
+        open_and_assert_resolver_family(ioHandle, AF_UNSPEC);
+        socketio_destroy(ioHandle);
+    }
 }
 
 TEST_FUNCTION(socketio_open_pending_connect_succeeds)

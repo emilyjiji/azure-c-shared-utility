@@ -63,6 +63,7 @@
 // is no budget shared across addresses: each candidate gets this in full, so a
 // blackholed address cannot deny the ones behind it their attempt.
 #define CONNECT_TIMEOUT_PER_ADDRESS_MS (CONNECT_TIMEOUT_PER_ADDRESS_SECONDS * 1000)
+#define MIN_CONNECT_POLL_REMAINING_MS 5
 #define SOCKETIO_POLL_TIMEOUT_ERROR 110  /* ETIMEDOUT equivalent for poll timeout */
 
 static int get_connect_time(struct timespec* now)
@@ -820,12 +821,13 @@ static int connect_to_addrinfo(SOCKET_IO_INSTANCE* socket_io_instance, const str
                             }
 
                             remaining_ns = deadline_ns - ((int64_t)now.tv_sec * 1000000000LL + now.tv_nsec);
-                            if (remaining_ns <= 0)
+                            remaining_ms = (remaining_ns > 0) ?
+                                (int)((remaining_ns + 999999LL) / 1000000LL) : 0;
+                            if (remaining_ms < MIN_CONNECT_POLL_REMAINING_MS)
                             {
                                 poll_result = 0;
                                 break;
                             }
-                            remaining_ms = (int)((remaining_ns + 999999LL) / 1000000LL);
                         }
                     }
                 } while ((poll_result < 0) && (poll_error == EINTR));

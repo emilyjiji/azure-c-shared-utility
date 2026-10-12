@@ -1387,9 +1387,8 @@ TEST_FUNCTION(socketio_open_eintr_at_the_deadline_reports_a_timeout)
     socketio_destroy(ioHandle);
 }
 
-/* Less than a millisecond left after an interruption is rounded up to one, so the
-   candidate is not cut short by the conversion to poll()'s millisecond timeout. */
-TEST_FUNCTION(socketio_open_rounds_a_sub_millisecond_remainder_up_after_eintr)
+/* Four milliseconds is below the cutoff, so the adapter does not poll again. */
+TEST_FUNCTION(socketio_open_does_not_poll_when_less_than_five_ms_remain)
 {
     const int families[] = { AF_INET };
     const ATTEMPT_OUTCOME outcomes[] = { ATTEMPT_EINTR_ADVANCES_CLOCK_THEN_TIMES_OUT };
@@ -1397,7 +1396,31 @@ TEST_FUNCTION(socketio_open_rounds_a_sub_millisecond_remainder_up_after_eintr)
     size_t fds_before;
 
     given_candidates(1, families, outcomes);
-    use_virtual_clock((int64_t)EXPECTED_PER_ADDRESS_TIMEOUT_MS * 1000000LL - 500000LL, 0);
+    use_virtual_clock((int64_t)EXPECTED_PER_ADDRESS_TIMEOUT_MS * 1000000LL - 4000000LL, 0);
+    ioHandle = create_socket_io(HOSTNAME_ARG, 1);
+    fds_before = open_fd_count();
+
+    ASSERT_ARE_EQUAL(int, 0, socketio_open(ioHandle, test_on_io_open_complete, NULL, test_on_bytes_received, NULL, test_on_io_error, NULL));
+
+    ASSERT_ARE_EQUAL(size_t, (size_t)1, g_poll_count);
+    ASSERT_ARE_EQUAL(int, EXPECTED_PER_ADDRESS_TIMEOUT_MS, g_poll_timeouts_ms[0]);
+    ASSERT_ARE_EQUAL(int, IO_OPEN_ERROR, g_open_result.result);
+    ASSERT_ARE_EQUAL(int, SOCKETIO_POLL_TIMEOUT_ERROR_CODE, g_open_result.code);
+    ASSERT_ARE_EQUAL(size_t, fds_before, open_fd_count());
+
+    socketio_destroy(ioHandle);
+}
+
+/* Rounding up to the five-millisecond cutoff still gives poll() one last wait. */
+TEST_FUNCTION(socketio_open_polls_when_rounded_remainder_is_five_ms)
+{
+    const int families[] = { AF_INET };
+    const ATTEMPT_OUTCOME outcomes[] = { ATTEMPT_EINTR_ADVANCES_CLOCK_THEN_TIMES_OUT };
+    CONCRETE_IO_HANDLE ioHandle;
+    size_t fds_before;
+
+    given_candidates(1, families, outcomes);
+    use_virtual_clock((int64_t)EXPECTED_PER_ADDRESS_TIMEOUT_MS * 1000000LL - 4500000LL, 0);
     ioHandle = create_socket_io(HOSTNAME_ARG, 1);
     fds_before = open_fd_count();
 
@@ -1405,7 +1428,7 @@ TEST_FUNCTION(socketio_open_rounds_a_sub_millisecond_remainder_up_after_eintr)
 
     ASSERT_ARE_EQUAL(size_t, (size_t)2, g_poll_count);
     ASSERT_ARE_EQUAL(int, EXPECTED_PER_ADDRESS_TIMEOUT_MS, g_poll_timeouts_ms[0]);
-    ASSERT_ARE_EQUAL(int, 1, g_poll_timeouts_ms[1]);
+    ASSERT_ARE_EQUAL(int, 5, g_poll_timeouts_ms[1]);
     ASSERT_ARE_EQUAL(int, IO_OPEN_ERROR, g_open_result.result);
     ASSERT_ARE_EQUAL(int, SOCKETIO_POLL_TIMEOUT_ERROR_CODE, g_open_result.code);
     ASSERT_ARE_EQUAL(size_t, fds_before, open_fd_count());

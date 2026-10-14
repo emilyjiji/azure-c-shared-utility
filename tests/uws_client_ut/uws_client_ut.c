@@ -2361,7 +2361,7 @@ TEST_FUNCTION(uws_client_close_async_while_WAITING_for_close_frame_closes_the_un
     uws_client_destroy(uws_client);
 }
 
-/* Tests_SRS_UWS_CLIENT_01_033: [ `uws_client_close_async` after a `uws_client_close_async` shall fail and return a non-zero value. ]*/
+/* Tests_SRS_UWS_CLIENT_01_032: [ `uws_client_close_async` when the client is already CLOSED shall fail and return a non-zero value. ]*/
 TEST_FUNCTION(uws_client_close_async_after_close_complete_fails)
 {
     // arrange
@@ -5602,6 +5602,7 @@ TEST_FUNCTION(when_a_CLOSE_frame_is_received_with_a_malformed_UTF8_text_the_conn
     UWS_CLIENT_HANDLE uws_client;
     const char test_upgrade_response[] = "HTTP/1.1 101 Switching Protocols\r\n\r\n";
     unsigned char close_frame[] = { 0x88, 0x03, 0x03, 0xEA, 0xDF };
+    uint16_t expected_close_code = 1002;
 
     tlsio_config.hostname = "test_host";
     tlsio_config.port = 444;
@@ -5619,6 +5620,8 @@ TEST_FUNCTION(when_a_CLOSE_frame_is_received_with_a_malformed_UTF8_text_the_conn
     STRICT_EXPECTED_CALL(xio_close(TEST_IO_HANDLE, IGNORED_PTR_ARG, IGNORED_PTR_ARG))
         .IgnoreArgument_callback_context()
         .IgnoreArgument_on_io_close_complete();
+    STRICT_EXPECTED_CALL(test_on_ws_peer_closed((void*)0x4301, IGNORED_PTR_ARG, IGNORED_PTR_ARG, 0))
+        .ValidateArgumentBuffer(2, &expected_close_code, sizeof(expected_close_code));
 
     // act
     g_on_bytes_received(g_on_bytes_received_context, close_frame, sizeof(close_frame));
